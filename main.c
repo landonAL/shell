@@ -14,6 +14,7 @@
 #include <dirent.h>
 #include <termios.h>
 #include <sys/stat.h>
+#include <glob.h>
 
 // ANSI color codes
 #define COLOR_BLACK "\033[0;30m"
@@ -82,116 +83,64 @@ int str_in_array(char* str, char** array, int count) {
 		return 0;
 }
 
-struct completion_result find_matching_commands(const char* partial) {
-		DIR* dir;
-		struct dirent* entry;
-		char* path;
-		char* dir_path;
-		size_t partial_len = strlen(partial);
-
-		// Initialize result struct
+struct completion_result find_matching_commands(const char* partial, int is_arg) {
 		struct completion_result result;
 		result.matches = malloc(100 * sizeof(char*));
 		result.count = 0;
 
-		if (partial_len == 0) {
+		if (strlen(partial) == 0) {
 				return result;
 		}
 
-		// Check for "cd " prefix
-		int is_cd = (strncmp(partial, "cd ", 3) == 0);
-		const char* search_term = is_cd ? partial + 3 : partial;
+		// Only do glob pattern matching for arguments
+		if (is_arg) {
+				glob_t globbuf;
+				char* pattern = malloc(strlen(partial) + 2);
+				strcpy(pattern, partial);
+				strcat(pattern, "*");
 
-		// Check for path component
-		char* last_slash = strrchr(search_term, '/');
-		char* search_dir;
-
-		if (last_slash) {
-				// If there's a slash, search in that directory
-				size_t dir_len = last_slash - search_term + 1;
-				search_dir = strndup(search_term, dir_len);
-				search_term = last_slash + 1;
-				dir = opendir(search_dir);
-		} else {
-				// If no slash, search in current directory
-				search_dir = ".";
-				dir = opendir(".");
-		}
-
-		if (dir) {
-				while ((entry = readdir(dir)) && result.count < 100) {
-						// Skip . and .. entries
-						if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-								continue;
-						}
-
-						// Only show directories for cd command
-						if (is_cd) {
-								if (entry->d_type == DT_DIR &&
-									strncmp(entry->d_name, search_term, strlen(search_term)) == 0) {
-										char* match;
-										if (last_slash) {
-												size_t match_len = strlen(search_dir) + strlen(entry->d_name) + 2;
-												match = malloc(match_len);
-												snprintf(match, match_len, "cd %s%s", search_dir, entry->d_name);
-										} else {
-												size_t match_len = strlen(entry->d_name) + 4; // "cd " + name
-												match = malloc(match_len);
-												snprintf(match, match_len, "cd %s", entry->d_name);
-										}
-										if (!str_in_array(match, result.matches, result.count)) {
-												result.matches[result.count++] = match;
-										} else {
-												free(match);
-										}
-								}
-						} else {
-								if (strncmp(entry->d_name, search_term, strlen(search_term)) == 0 &&
-										entry->d_type != DT_DIR) { // Don't include directories if not cd
-										char* match;
-										if (last_slash) {
-												size_t match_len = strlen(search_dir) + strlen(entry->d_name) + 2;
-												match = malloc(match_len);
-												snprintf(match, match_len, "%s%s", search_dir, entry->d_name);
-										} else {
-												match = strdup(entry->d_name);
-										}
-										if (!str_in_array(match, result.matches, result.count)) {
-												result.matches[result.count++] = match;
-										} else {
-												free(match);
-										}
+				int glob_flags = GLOB_TILDE | GLOB_MARK;
+				if (glob(pattern, glob_flags, NULL, &globbuf) == 0) {
+						for (size_t i = 0; i < globbuf.gl_pathc && result.count < 100; i++) {
+								// Check for duplicates before adding
+								if (!str_in_array(globbuf.gl_pathv[i], result.matches, result.count)) {
+										result.matches[result.count++] = strdup(globbuf.gl_pathv[i]);
 								}
 						}
 				}
-				closedir(dir);
+
+				free(pattern);
+				globfree(&globbuf);
+
+				return result;
 		}
 
-		if (last_slash && search_dir != NULL) {
-				free(search_dir);
-		}
-
-		// Only search PATH for executables if not doing cd completion
-		if (!is_cd && !last_slash) {
-				path = getenv("PATH");
+		// For command completion, search PATH
+		if (strchr(partial, '/') == NULL) {
+				char* path = getenv("PATH");
 				if (path) {
 						char* path_copy = strdup(path);
-						dir_path = strtok(path_copy, ":");
-
-						while (dir_path != NULL && result.count < 100) {
-								dir = opendir(dir_path);
-								if (dir) {
-										while ((entry = readdir(dir)) && result.count < 100) {
-												if (strncmp(entry->d_name, partial, partial_len) == 0 &&
-														entry->d_type != DT_DIR) { // Skip directories in PATH
-														if (!str_in_array(entry->d_name, result.matches, result.count)) {
-																result.matches[result.count++] = strdup(entry->d_name);
+						char* dir = strtok(path_copy, ":");
+						while (dir != NULL && result.count < 100) {
+								DIR* d = opendir(dir);
+								if (d) {
+										struct dirent* entry;
+										while ((entry = readdir(d)) && result.count < 100) {
+												if (strncmp(entry->d_name, partial, strlen(partial)) == 0) {
+														char* full_path = malloc(strlen(dir) + strlen(entry->d_name) + 2);
+														sprintf(full_path, "%s/%s", dir, entry->d_name);
+														if (access(full_path, X_OK) == 0) {
+																// Check for duplicates before adding
+																if (!str_in_array(entry->d_name, result.matches, result.count)) {
+																		result.matches[result.count++] = strdup(entry->d_name);
+																}
 														}
+														free(full_path);
 												}
 										}
-										closedir(dir);
+										closedir(d);
 								}
-								dir_path = strtok(NULL, ":");
+								dir = strtok(NULL, ":");
 						}
 						free(path_copy);
 				}
@@ -388,24 +337,28 @@ char *lsh_read_line(void)
 						}
 				} else if (c == '\t') {
 						buffer[position] = '\0';
-						struct completion_result completions = find_matching_commands(buffer);
+						char *last_space = strrchr(buffer, ' ');
+						int is_arg = (last_space != NULL);
+						char *completion_str = is_arg ? last_space + 1 : buffer;
+
+						struct completion_result completions = find_matching_commands(completion_str, is_arg);
 
 						if (completions.count == 1) {
-								// Single match - complete it
-								strncpy(buffer, completions.matches[0], bufsize - 1);
-								buffer[bufsize - 1] = '\0';
-								position = strlen(buffer);
+								if (is_arg) {
+										// Replace only the part after the last space
+										strcpy(last_space + 1, completions.matches[0]);
+										position = strlen(buffer);
+								} else {
+										strcpy(buffer, completions.matches[0]);
+										position = strlen(buffer);
+								}
 								cursor_pos = position;
 								printf("\r%s❯%s %s", COLOR_BLUE, COLOR_RESET, buffer);
 						} else if (completions.count > 1) {
-								// Multiple matches - show them all
 								printf("\n");
 								for (int i = 0; i < completions.count; i++) {
-										if (strncmp(buffer, "cd ", 3) == 0 && is_directory(completions.matches[i])) {
-												printf("%s/  ", completions.matches[i]);
-										} else {
-												printf("%s  ", completions.matches[i]);
-										}
+										printf("%s%s%s  ", is_directory(completions.matches[i]) ? COLOR_BLUE : "",
+												completions.matches[i], COLOR_RESET);
 								}
 								printf("\n%s❯%s %s", COLOR_BLUE, COLOR_RESET, buffer);
 						}
