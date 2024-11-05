@@ -13,6 +13,7 @@
 #include <string.h>
 #include <dirent.h>
 #include <termios.h>
+#include <sys/stat.h>
 
 // ANSI color codes
 #define COLOR_BLACK "\033[0;30m"
@@ -32,6 +33,14 @@
 #define COLOR_BRIGHT_CYAN "\033[1;36m"
 #define COLOR_BRIGHT_WHITE "\033[1;37m"
 #define COLOR_RESET "\033[0m"
+
+// Helper function to check if path is directory
+int is_directory(const char *path) {
+				struct stat statbuf;
+				if (stat(path, &statbuf) != 0)
+								return 0;
+				return S_ISDIR(statbuf.st_mode);
+}
 
 /*
 		Function Declarations for builtin shell commands:
@@ -60,55 +69,135 @@ int lsh_num_builtins() {
 }
 
 struct completion_result {
-				char** matches;
-				int count;
+		char** matches;
+		int count;
 };
 
+int str_in_array(char* str, char** array, int count) {
+		for(int i = 0; i < count; i++) {
+				if(strcmp(str, array[i]) == 0) {
+						return 1;
+				}
+		}
+		return 0;
+}
+
 struct completion_result find_matching_commands(const char* partial) {
-								DIR* dir;
-								struct dirent* entry;
-								char* path = getenv("PATH");
-								char* path_copy = strdup(path);
-								char* dir_path = strtok(path_copy, ":");
-								size_t partial_len = strlen(partial);
+		DIR* dir;
+		struct dirent* entry;
+		char* path;
+		char* dir_path;
+		size_t partial_len = strlen(partial);
 
-								// Initialize result struct
-								struct completion_result result;
-								result.matches = malloc(100 * sizeof(char*)); // Allow up to 100 matches
-								result.count = 0;
+		// Initialize result struct
+		struct completion_result result;
+		result.matches = malloc(100 * sizeof(char*));
+		result.count = 0;
 
-								// Hash table to track seen entries
-								char* seen[1000] = {NULL};
-								int seen_count = 0;
+		if (partial_len == 0) {
+				return result;
+		}
 
-								while (dir_path != NULL) {
-																dir = opendir(dir_path);
-																if (dir) {
-																								while ((entry = readdir(dir))) {
-																																if (strncmp(entry->d_name, partial, partial_len) == 0) {
-																																								// Check if we've seen this entry before
-																																								int duplicate = 0;
-																																								for (int i = 0; i < seen_count; i++) {
-																																												if (strcmp(seen[i], entry->d_name) == 0) {
-																																																duplicate = 1;
-																																																break;
-																																												}
-																																								}
+		// Check for "cd " prefix
+		int is_cd = (strncmp(partial, "cd ", 3) == 0);
+		const char* search_term = is_cd ? partial + 3 : partial;
 
-																																								if (!duplicate) {
-																																												result.matches[result.count] = strdup(entry->d_name);
-																																												seen[seen_count++] = result.matches[result.count];
-																																												result.count++;
-																																								}
-																																}
-																								}
-																								closedir(dir);
-																}
-																dir_path = strtok(NULL, ":");
+		// Check for path component
+		char* last_slash = strrchr(search_term, '/');
+		char* search_dir;
+
+		if (last_slash) {
+				// If there's a slash, search in that directory
+				size_t dir_len = last_slash - search_term + 1;
+				search_dir = strndup(search_term, dir_len);
+				search_term = last_slash + 1;
+				dir = opendir(search_dir);
+		} else {
+				// If no slash, search in current directory
+				search_dir = ".";
+				dir = opendir(".");
+		}
+
+		if (dir) {
+				while ((entry = readdir(dir)) && result.count < 100) {
+						// Skip . and .. entries
+						if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+								continue;
+						}
+
+						// Only show directories for cd command
+						if (is_cd) {
+								if (entry->d_type == DT_DIR &&
+									strncmp(entry->d_name, search_term, strlen(search_term)) == 0) {
+										char* match;
+										if (last_slash) {
+												size_t match_len = strlen(search_dir) + strlen(entry->d_name) + 2;
+												match = malloc(match_len);
+												snprintf(match, match_len, "cd %s%s", search_dir, entry->d_name);
+										} else {
+												size_t match_len = strlen(entry->d_name) + 4; // "cd " + name
+												match = malloc(match_len);
+												snprintf(match, match_len, "cd %s", entry->d_name);
+										}
+										if (!str_in_array(match, result.matches, result.count)) {
+												result.matches[result.count++] = match;
+										} else {
+												free(match);
+										}
 								}
+						} else {
+								if (strncmp(entry->d_name, search_term, strlen(search_term)) == 0 &&
+										entry->d_type != DT_DIR) { // Don't include directories if not cd
+										char* match;
+										if (last_slash) {
+												size_t match_len = strlen(search_dir) + strlen(entry->d_name) + 2;
+												match = malloc(match_len);
+												snprintf(match, match_len, "%s%s", search_dir, entry->d_name);
+										} else {
+												match = strdup(entry->d_name);
+										}
+										if (!str_in_array(match, result.matches, result.count)) {
+												result.matches[result.count++] = match;
+										} else {
+												free(match);
+										}
+								}
+						}
+				}
+				closedir(dir);
+		}
 
-								free(path_copy);
-								return result;
+		if (last_slash && search_dir != NULL) {
+				free(search_dir);
+		}
+
+		// Only search PATH for executables if not doing cd completion
+		if (!is_cd && !last_slash) {
+				path = getenv("PATH");
+				if (path) {
+						char* path_copy = strdup(path);
+						dir_path = strtok(path_copy, ":");
+
+						while (dir_path != NULL && result.count < 100) {
+								dir = opendir(dir_path);
+								if (dir) {
+										while ((entry = readdir(dir)) && result.count < 100) {
+												if (strncmp(entry->d_name, partial, partial_len) == 0 &&
+														entry->d_type != DT_DIR) { // Skip directories in PATH
+														if (!str_in_array(entry->d_name, result.matches, result.count)) {
+																result.matches[result.count++] = strdup(entry->d_name);
+														}
+												}
+										}
+										closedir(dir);
+								}
+								dir_path = strtok(NULL, ":");
+						}
+						free(path_copy);
+				}
+		}
+
+		return result;
 }
 
 /*
@@ -303,15 +392,20 @@ char *lsh_read_line(void)
 
 						if (completions.count == 1) {
 								// Single match - complete it
-								strcpy(buffer, completions.matches[0]);
-								position = strlen(completions.matches[0]);
+								strncpy(buffer, completions.matches[0], bufsize - 1);
+								buffer[bufsize - 1] = '\0';
+								position = strlen(buffer);
 								cursor_pos = position;
 								printf("\r%s❯%s %s", COLOR_BLUE, COLOR_RESET, buffer);
 						} else if (completions.count > 1) {
 								// Multiple matches - show them all
 								printf("\n");
 								for (int i = 0; i < completions.count; i++) {
-										printf("%s  ", completions.matches[i]);
+										if (strncmp(buffer, "cd ", 3) == 0 && is_directory(completions.matches[i])) {
+												printf("%s/  ", completions.matches[i]);
+										} else {
+												printf("%s  ", completions.matches[i]);
+										}
 								}
 								printf("\n%s❯%s %s", COLOR_BLUE, COLOR_RESET, buffer);
 						}
