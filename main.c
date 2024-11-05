@@ -306,14 +306,14 @@ char *lsh_read_line(void)
 								strcpy(buffer, completions.matches[0]);
 								position = strlen(completions.matches[0]);
 								cursor_pos = position;
-								printf("\r❯ %s", buffer);
+								printf("\r%s❯%s %s", COLOR_BLUE, COLOR_RESET, buffer);
 						} else if (completions.count > 1) {
 								// Multiple matches - show them all
 								printf("\n");
 								for (int i = 0; i < completions.count; i++) {
 										printf("%s  ", completions.matches[i]);
 								}
-								printf("\n❯ %s", buffer);
+								printf("\n%s❯%s %s", COLOR_BLUE, COLOR_RESET, buffer);
 						}
 						fflush(stdout);
 
